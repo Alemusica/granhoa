@@ -23,6 +23,14 @@ static inline double wrap_pi(double x){ while(x> M_PI)x-=2.*M_PI; while(x<-M_PI)
 static inline double clampd(double v,double lo,double hi){ return v<lo?lo:(v>hi?hi:v); }
 static inline double deg2rad(double d){ return d * (M_PI/180.0); }
 
+static inline void fib_point(int N, int i, double& az, double& el){
+    const double ga = M_PI * (3.0 - std::sqrt(5.0));
+    double z = 1.0 - 2.0 * ((i + 0.5) / (double)N);
+    double lon = std::fmod(i * ga, 2.0 * M_PI) - M_PI;
+    az = lon;
+    el = std::asin(clampd(z, -1.0, 1.0));
+}
+
 static inline void unit_from_azel(double az,double el,double&x,double&y,double&z){
     double cel=cos(el); x=cel*cos(az); y=cel*sin(az); z=sin(el);
 }
@@ -200,6 +208,7 @@ typedef struct _granhoa {
     double spread_az_deg=90.0;   // nuova
     double spread_el_deg=25.0;   // nuova
     double depth_bias=0.0;       // -1..+1; -1 front, +1 back
+    long   dist_mode=1;          // 0=random, 1=fibonacci
 
     std::vector<Micro> micros; // ntrack*Kmax
     uint32_t seed=1234u;
@@ -245,6 +254,7 @@ t_max_err ildmax_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err spreadaz_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err spreadel_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err depthbias_set(t_granhoa*, t_object*, long, t_atom*);
+t_max_err distmode_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err tailms_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err predelayms_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err atkback_set(t_granhoa*, t_object*, long, t_atom*);
@@ -287,6 +297,11 @@ extern "C" int C74_EXPORT main(void){
     CLASS_ATTR_DOUBLE(c,"density",0,t_granhoa,density);
     CLASS_ATTR_ACCESSORS(c,"density",NULL,(method)density_set);
     CLASS_ATTR_SAVE(c,"density",0);
+
+    CLASS_ATTR_LONG(c,"dist",0,t_granhoa,dist_mode);
+    CLASS_ATTR_LABEL(c,"dist",0,"Distribution: 0=random 1=fibonacci");
+    CLASS_ATTR_ACCESSORS(c,"dist",NULL,(method)distmode_set);
+    CLASS_ATTR_SAVE(c,"dist",0);
 
     CLASS_ATTR_LONG(c,"mode",0,t_granhoa,mode);
     CLASS_ATTR_ACCESSORS(c,"mode",NULL,(method)mode_set);
@@ -369,6 +384,8 @@ void *granhoa_new(t_symbol*, long, t_atom*){
     while(ss>>tok && ac<32){ atom_setsym(at+ac,gensym(tok.c_str())); ac++; }
     granhoa_set_ratios(x,gensym("ratios"),ac,at);
 
+    x->dist_mode = 1;
+
     rebuild_all(x);
     return x;
 }
@@ -418,6 +435,7 @@ t_max_err ildmax_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ 
 t_max_err spreadaz_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->spread_az_deg=clampd(atom_getfloat(av),0.0,180.0); build_micros(x);} return MAX_ERR_NONE; }
 t_max_err spreadel_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->spread_el_deg=clampd(atom_getfloat(av),0.0,90.0); build_micros(x);} return MAX_ERR_NONE; }
 t_max_err depthbias_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->depth_bias=clampd(atom_getfloat(av),-1.0,1.0); build_micros(x);} return MAX_ERR_NONE; }
+t_max_err distmode_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->dist_mode=(long)clampd(atom_getlong(av),0,1); build_micros(x);} return MAX_ERR_NONE; }
 t_max_err tailms_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->tail_ms=clampd(atom_getfloat(av),0.0,2000.0); ensure_tail(x);} return MAX_ERR_NONE; }
 t_max_err predelayms_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->predelay_ms=clampd(atom_getfloat(av),0.0,300.0); ensure_tail(x);} return MAX_ERR_NONE; }
 t_max_err atkback_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->atkboost_back_db=atom_getfloat(av);} return MAX_ERR_NONE; }
@@ -454,16 +472,35 @@ static void build_micros(t_granhoa *x){
 
     for(long t=0;t<x->ntrack;++t){
         for(long k=0;k<x->Kmax;++k){
-            double side = (u01(st)<0.5)? -1.0 : +1.0;
-            double jitter_az = (u01(st)*2.0 - 1.0) * saz;
-            double jitter_el = (u01(st)*2.0 - 1.0) * sel;
+            double az=0.0, el=0.0;
+            if(x->dist_mode==1){
+                int N = (int)std::max<long>(1, x->Kmax);
+                int idx = (int)((k + 97 * t) % N);
+                double base_az=0.0, base_el=0.0;
+                fib_point(N, idx, base_az, base_el);
 
-            double az = side * clampd(abs_center + jitter_az, 0.0, M_PI);
-            // porta in [-pi,pi]
-            if(az> M_PI) az-=2.0*M_PI;
-            if(az<-M_PI) az+=2.0*M_PI;
+                double jitter_az = clampd((base_az / M_PI) * saz, -saz, saz);
+                double jitter_el = clampd((base_el / (M_PI * 0.5)) * sel, -sel, sel);
 
-            double el = clampd(jitter_el, -M_PI/2.0, +M_PI/2.0);
+                double abs_az = clampd(abs_center + jitter_az, 0.0, M_PI);
+                double sign = (base_az>=0.0)?1.0:-1.0;
+                az = sign * abs_az;
+                if(az> M_PI) az-=2.0*M_PI;
+                if(az<-M_PI) az+=2.0*M_PI;
+
+                el = clampd(jitter_el, -M_PI/2.0, +M_PI/2.0);
+            } else {
+                double side = (u01(st)<0.5)? -1.0 : +1.0;
+                double jitter_az = (u01(st)*2.0 - 1.0) * saz;
+                double jitter_el = (u01(st)*2.0 - 1.0) * sel;
+
+                az = side * clampd(abs_center + jitter_az, 0.0, M_PI);
+                // porta in [-pi,pi]
+                if(az> M_PI) az-=2.0*M_PI;
+                if(az<-M_PI) az+=2.0*M_PI;
+
+                el = clampd(jitter_el, -M_PI/2.0, +M_PI/2.0);
+            }
 
             Micro m{};
             m.az=az; m.el=el;
