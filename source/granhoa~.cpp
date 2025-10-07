@@ -95,7 +95,7 @@ typedef struct _granhoa {
     long num_ratios; double* ratios;
     // DSP
     double sr, inv_sr; long max_vs; long nsh; long alloc_vs; long alloc_nsh;
-    t_tracker* trk;
+    t_tracker* trk; long alloc_tracks;
     // Legacy HOA buffers (kept for debug/fallback)
     double** cbuf; double* D;
     // Output temps
@@ -116,6 +116,7 @@ void  granhoa_ratios(t_granhoa* x, t_symbol* s, long ac, t_atom* av);
 static void granhoa_build_decoder(t_granhoa* x);
 static void granhoa_prepare_buffers(t_granhoa* x);
 static void granhoa_update_targets(t_granhoa* x);
+static void granhoa_attr_modified(t_granhoa* x, t_symbol* attr_name);
 
 // ------------------------------ Class init ------------------------------
 extern "C" int C74_EXPORT main(void) {
@@ -123,6 +124,7 @@ extern "C" int C74_EXPORT main(void) {
     class_addmethod(c, (method)granhoa_assist, "assist", A_CANT, 0);
     class_addmethod(c, (method)granhoa_dsp64, "dsp64", A_CANT, 0);
     class_addmethod(c, (method)granhoa_ratios, "ratios", A_GIMME, 0);
+    class_addmethod(c, (method)granhoa_attr_modified, "attr_modified", A_SYM, 0);
     class_dspinit(c);
     // Attributes
     CLASS_ATTR_LONG  (c, "maxtrack",   0, t_granhoa, maxtrack);
@@ -162,6 +164,7 @@ void* granhoa_new(t_symbol* s, long ac, t_atom* av){
     x->alloc_vs = x->max_vs; x->alloc_nsh = x->nsh;
     // Trackers
     x->trk = (t_tracker*)sysmem_newptrclear(sizeof(t_tracker)*x->maxtrack);
+    x->alloc_tracks = x->maxtrack;
     for(long i=0;i<x->maxtrack;++i){ t_tracker* t=&x->trk[i]; t->amp_lp=0.0; t->phase=0.0; t->omega=0.0; t->omega_target=0.0; t->kp=0.0005; t->ki=0.00001; t->gate=0.0; t->seed=0x9E3779B9u*(uint32_t)(i+1); double g=(i+1)*137.50776405003785; t->base_az=radians(fmod(g,360.0)); t->base_el=radians((fmod(g*0.5,120.0)-60.0)); }
     // Buffers (legacy HOA kept), temps, ears
     x->cbuf=(double**)sysmem_newptrclear(sizeof(double*)*x->alloc_nsh); for(long i=0;i<x->alloc_nsh;++i) x->cbuf[i]=(double*)sysmem_newptrclear(sizeof(double)*x->alloc_vs);
@@ -188,6 +191,25 @@ void granhoa_assist(t_granhoa* x, void* b, long m, long a, char* s){ if (m==ASSI
 
 // ------------------------------ Attr/messages ------------------------------
 void granhoa_ratios(t_granhoa* x, t_symbol* s, long ac, t_atom* av){ if (ac<=0) return; double* r=(double*)sysmem_newptr(sizeof(double)*ac); if(!r) return; for(long i=0;i<ac;++i){ double v=0.0; if (atom_gettype(av+i)==A_LONG) v=(double)atom_getlong(av+i); else if(atom_gettype(av+i)==A_FLOAT) v=atom_getfloat(av+i); r[i]=(v<=0.0)?0.0:v; } if (x->ratios) sysmem_freeptr(x->ratios); x->ratios=r; x->num_ratios=ac; granhoa_update_targets(x); }
+
+static inline long granhoa_active_tracks(t_granhoa* x){ long T = x->maxtrack; if (T < 0) T = 0; if (x->alloc_tracks > 0 && T > x->alloc_tracks) T = x->alloc_tracks; return T; }
+
+static void granhoa_attr_modified(t_granhoa* x, t_symbol* attr_name){
+    if (!attr_name) return;
+    if (attr_name == gensym("tonic")){
+        granhoa_update_targets(x);
+    } else if (attr_name == gensym("maxtrack")){
+        long T = x->maxtrack;
+        if (T < 1) T = 1;
+        if (x->alloc_tracks > 0 && T > x->alloc_tracks){
+            object_warn((t_object*)x, "maxtrack is limited to %ld voices (allocated at instantiation)", x->alloc_tracks);
+            x->maxtrack = x->alloc_tracks;
+        } else {
+            x->maxtrack = T;
+        }
+        granhoa_update_targets(x);
+    }
+}
 
 // Geometric decoder kept for fallback/testing (unused with synth=1)
 static void granhoa_build_decoder(t_granhoa* x){
@@ -217,7 +239,19 @@ static void granhoa_prepare_buffers(t_granhoa* x){
     }
 }
 
-static void granhoa_update_targets(t_granhoa* x){ long T=x->maxtrack; double sr=(x->sr>0?x->sr:48000.0); for(long i=0;i<T;++i){ double ratio=(i<x->num_ratios)?x->ratios[i]:(double)(i+1); double f=x->tonic*ratio; if(f<0.1) f=0.1; x->trk[i].omega_target=2.0*M_PI*(f/sr); if (x->trk[i].omega==0.0) x->trk[i].omega=x->trk[i].omega_target; } }
+static void granhoa_update_targets(t_granhoa* x){
+    long T = granhoa_active_tracks(x);
+    if (T <= 0 || !x->trk) return;
+    double sr=(x->sr>0?x->sr:48000.0);
+    for(long i=0;i<T;++i){
+        double ratio=(i<x->num_ratios)?x->ratios[i]:(double)(i+1);
+        double f=x->tonic*ratio;
+        if(f<0.1) f=0.1;
+        x->trk[i].omega_target=2.0*M_PI*(f/sr);
+        if (x->trk[i].omega==0.0)
+            x->trk[i].omega=x->trk[i].omega_target;
+    }
+}
 
 // ------------------------------ DSP ------------------------------
 static inline void memzero(double* p, long n){ memset(p,0,sizeof(double)*n); }
@@ -234,7 +268,8 @@ static inline double itd_seconds(double head_radius_m, double az){ const double 
 void granhoa_perform64(t_granhoa* x, t_object* dsp64, double** ins, long numins, double** outs, long numouts, long N, long flags, void* userparam){
     double* in=ins[0]; double* outL=outs[0]; double* outR=outs[1];
     memzero(x->tmpL, N); memzero(x->tmpR, N);
-    const long T=x->maxtrack; const long K=(x->K<1?1:(x->K>KMAX?KMAX:x->K)); const double density=clamp(x->density,0.0,4.0);
+    const long T=granhoa_active_tracks(x);
+    const long K=(x->K<1?1:(x->K>KMAX?KMAX:x->K)); const double density=clamp(x->density,0.0,4.0);
     const double spread_az=radians(x->spread_az_deg), spread_el=radians(x->spread_el_deg); const double drift_ratio=pow(2.0, x->drift_cents/1200.0);
     const double head_radius_m = x->head_radius_cm*0.01; const double shelf_fc = x->shelf_fc; const double max_ild = x->ild_db;
 
