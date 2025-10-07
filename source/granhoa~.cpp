@@ -458,7 +458,8 @@ static void build_micros(t_granhoa *x){
             double jitter_az = (u01(st)*2.0 - 1.0) * saz;
             double jitter_el = (u01(st)*2.0 - 1.0) * sel;
 
-            double az = side * clampd(abs_center + jitter_az, 0.0, M_PI);
+            double abs_az = clampd(std::fabs(abs_center + jitter_az), 0.0, M_PI);
+            double az = side * abs_az;
             // porta in [-pi,pi]
             if(az> M_PI) az-=2.0*M_PI;
             if(az<-M_PI) az+=2.0*M_PI;
