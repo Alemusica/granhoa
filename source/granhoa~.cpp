@@ -141,6 +141,13 @@ struct Micro {
     FracDelay fdL, fdR;
 };
 
+struct EarlyTap {
+    double az=0.0, el=0.0;
+    double gain=0.0;
+    double gL=1.0, gR=1.0;
+    FracDelay fdL, fdR;
+};
+
 static inline double woodworth_itd(double az, double headRad, double c){
     double th = clampd(az, -M_PI/2.0, +M_PI/2.0);
     return (headRad/c) * (th + sin(th)); // sec
@@ -231,6 +238,13 @@ typedef struct _granhoa {
     // tail
     double tail_ms=120.0, predelay_ms=10.0;
     SimpleComb comb;
+
+    // early reflections
+    std::vector<EarlyTap> early;
+    long earlyN=0;
+    double early_ms=45.0;
+    double early_gain=0.45;
+    double early_decay=0.78;
 } t_granhoa;
 
 // fwd
@@ -258,6 +272,10 @@ t_max_err spreadel_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err depthbias_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err tailms_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err predelayms_set(t_granhoa*, t_object*, long, t_atom*);
+t_max_err earlyN_set(t_granhoa*, t_object*, long, t_atom*);
+t_max_err earlyms_set(t_granhoa*, t_object*, long, t_atom*);
+t_max_err earlygain_set(t_granhoa*, t_object*, long, t_atom*);
+t_max_err earlydecay_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err atkback_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err atkfront_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err tfast_set(t_granhoa*, t_object*, long, t_atom*);
@@ -270,6 +288,7 @@ static void alloc_trackers(t_granhoa*);
 static void build_micros(t_granhoa*);
 static void update_Kcur(t_granhoa*);
 static void ensure_tail(t_granhoa*);
+static void build_early(t_granhoa*);
 static void update_transient_coeffs(t_granhoa*);
 
 //===================== Boilerplate =======================
@@ -364,6 +383,23 @@ extern "C" int C74_EXPORT main(void){
     CLASS_ATTR_ACCESSORS(c,"predelay_ms",NULL,(method)predelayms_set);
     CLASS_ATTR_SAVE(c,"predelay_ms",0);
 
+    // Early reflections
+    CLASS_ATTR_LONG(c,"earlyN",0,t_granhoa,earlyN);
+    CLASS_ATTR_ACCESSORS(c,"earlyN",NULL,(method)earlyN_set);
+    CLASS_ATTR_SAVE(c,"earlyN",0);
+
+    CLASS_ATTR_DOUBLE(c,"early_ms",0,t_granhoa,early_ms);
+    CLASS_ATTR_ACCESSORS(c,"early_ms",NULL,(method)earlyms_set);
+    CLASS_ATTR_SAVE(c,"early_ms",0);
+
+    CLASS_ATTR_DOUBLE(c,"early_gain",0,t_granhoa,early_gain);
+    CLASS_ATTR_ACCESSORS(c,"early_gain",NULL,(method)earlygain_set);
+    CLASS_ATTR_SAVE(c,"early_gain",0);
+
+    CLASS_ATTR_DOUBLE(c,"early_decay",0,t_granhoa,early_decay);
+    CLASS_ATTR_ACCESSORS(c,"early_decay",NULL,(method)earlydecay_set);
+    CLASS_ATTR_SAVE(c,"early_decay",0);
+
     class_dspinit(c);
     class_register(CLASS_BOX,c);
     granhoa_class=c; return 0;
@@ -430,13 +466,17 @@ t_max_err density_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){
 t_max_err mode_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->mode=(long)clampd(atom_getlong(av),0,1);} return MAX_ERR_NONE; }
 t_max_err distmode_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ long v=atom_getlong(av); x->dist_mode=(long)clampd(v,0,1); build_micros(x);} return MAX_ERR_NONE; }
 t_max_err seed_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->seed=(uint32_t)atom_getlong(av); build_micros(x);} return MAX_ERR_NONE; }
-t_max_err headrad_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->head_radius_m=clampd(atom_getfloat(av),0.05,0.12); build_micros(x);} return MAX_ERR_NONE; }
-t_max_err ildmax_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->ild_db_max=clampd(atom_getfloat(av),0.0,24.0); build_micros(x);} return MAX_ERR_NONE; }
+t_max_err headrad_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->head_radius_m=clampd(atom_getfloat(av),0.05,0.12); build_micros(x); build_early(x);} return MAX_ERR_NONE; }
+t_max_err ildmax_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->ild_db_max=clampd(atom_getfloat(av),0.0,24.0); build_micros(x); build_early(x);} return MAX_ERR_NONE; }
 t_max_err spreadaz_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->spread_az_deg=clampd(atom_getfloat(av),0.0,180.0); build_micros(x);} return MAX_ERR_NONE; }
 t_max_err spreadel_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->spread_el_deg=clampd(atom_getfloat(av),0.0,90.0); build_micros(x);} return MAX_ERR_NONE; }
 t_max_err depthbias_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->depth_bias=clampd(atom_getfloat(av),-1.0,1.0); build_micros(x);} return MAX_ERR_NONE; }
 t_max_err tailms_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->tail_ms=clampd(atom_getfloat(av),0.0,2000.0); ensure_tail(x);} return MAX_ERR_NONE; }
-t_max_err predelayms_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->predelay_ms=clampd(atom_getfloat(av),0.0,300.0); ensure_tail(x);} return MAX_ERR_NONE; }
+t_max_err predelayms_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->predelay_ms=clampd(atom_getfloat(av),0.0,300.0); ensure_tail(x); build_early(x);} return MAX_ERR_NONE; }
+t_max_err earlyN_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ long v=atom_getlong(av); if(v<0)v=0; if(v>64)v=64; x->earlyN=v; build_early(x);} return MAX_ERR_NONE; }
+t_max_err earlyms_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->early_ms=clampd(atom_getfloat(av),0.0,200.0); build_early(x);} return MAX_ERR_NONE; }
+t_max_err earlygain_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->early_gain=clampd(atom_getfloat(av),0.0,2.0); build_early(x);} return MAX_ERR_NONE; }
+t_max_err earlydecay_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->early_decay=clampd(atom_getfloat(av),0.0,0.999); build_early(x);} return MAX_ERR_NONE; }
 t_max_err atkback_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->atkboost_back_db=atom_getfloat(av);} return MAX_ERR_NONE; }
 t_max_err atkfront_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->atkboost_front_db=atom_getfloat(av);} return MAX_ERR_NONE; }
 t_max_err tfast_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->tfast_ms=clampd(atom_getfloat(av),0.2,20.0); update_transient_coeffs(x);} return MAX_ERR_NONE; }
@@ -535,6 +575,44 @@ static void ensure_tail(t_granhoa *x){
     if(tailS<1) tailS=1;
     x->comb.setup(predS, tailS);
 }
+static void build_early(t_granhoa *x){
+    x->early.clear();
+    long N = x->earlyN;
+    if(N<=0) return;
+
+    double sr = (x->sr>0.0)?x->sr:48000.0;
+    const double PHI = (1.0 + std::sqrt(5.0)) * 0.5;
+    double maxITD = (x->head_radius_m / x->speed_c) * (M_PI/2.0 + 1.0);
+    int maxS = (int)std::ceil(((x->predelay_ms + x->early_ms) * 0.001 + maxITD) * sr) + 8;
+    if(maxS < 64) maxS = 64;
+
+    x->early.resize((size_t)N);
+    for(long i=0;i<N;++i){
+        double frac = std::fmod((i + 1) * (PHI - 1.0), 1.0);
+        if(frac < 0.0) frac += 1.0;
+        double t0 = x->predelay_ms * 0.001 + frac * (x->early_ms * 0.001);
+
+        double az=0.0, el=0.0;
+        fib_point((int)N, (int)i, az, el);
+
+        EarlyTap e{};
+        e.az = az; e.el = el;
+        ild_gains_from_dir(az, el, x->ild_db_max, e.gL, e.gR);
+
+        double itd = woodworth_itd(az, x->head_radius_m, x->speed_c);
+        double dL = t0 + (itd < 0.0 ? std::fabs(itd) : 0.0);
+        double dR = t0 + (itd > 0.0 ? std::fabs(itd) : 0.0);
+
+        e.fdL.init_pow2(maxS);
+        e.fdR.init_pow2(maxS);
+        e.fdL.setDelay(dL * sr);
+        e.fdR.setDelay(dR * sr);
+
+        e.gain = x->early_gain * std::pow(x->early_decay, (double)i);
+
+        x->early[(size_t)i] = e;
+    }
+}
 static void update_transient_coeffs(t_granhoa *x){
     double Tf = std::max(0.0002, x->tfast_ms*0.001);
     double Ts = std::max(0.005,   x->tslow_ms*0.001);
@@ -546,6 +624,7 @@ static void rebuild_all(t_granhoa *x){
     build_micros(x);
     update_Kcur(x);
     ensure_tail(x);
+    build_early(x);
     update_transient_coeffs(x);
 }
 
@@ -618,6 +697,16 @@ void granhoa_perform64(t_granhoa *x, t_object*, double **ins, long, double **out
                 }
             }
         }
+
+        // --- Early reflections ---
+        double ydir = y; // mono input
+        double Le=0.0, Re=0.0;
+        for(auto &e: x->early){
+            double xe = ydir;
+            Le += e.fdL.process(xe) * e.gL * e.gain;
+            Re += e.fdR.process(xe) * e.gR * e.gain;
+        }
+        L += Le; R += Re;
 
         // --- Tail (predelay + comb) ---
         double outl = x->comb.procL(L, gtail);
