@@ -132,6 +132,17 @@ struct FracDelay {
     }
 };
 
+struct OnePole{
+    double a=0.0, b=0.0, z=0.0;
+    inline void set_lp_fc(double fc,double sr){
+        if(sr<=0.0){ a=1.0; b=0.0; z=0.0; return; }
+        double f = std::max(1.0, fc);
+        double a1=std::exp(-2.0*M_PI*f/sr);
+        a=1.0-a1; b=a1; z=0.0;
+    }
+    inline double process(double x){ z=a*x + b*z; return z; }
+};
+
 struct Micro {
     double az=0.0, el=0.0;   // posizione
     double gainL=1.0, gainR=1.0; // ILD
@@ -139,6 +150,7 @@ struct Micro {
     double backness=0.0;     // 0=front, 1=back (per transient shaping)
 
     FracDelay fdL, fdR;
+    OnePole   lpL, lpR;
 };
 
 struct EarlyTap {
@@ -226,6 +238,7 @@ typedef struct _granhoa {
     double head_radius_m=0.087;
     double speed_c=343.0;
     double ild_db_max=12.0;
+    char   headshadow_on=0;
 
     // transient designer
     double atkboost_back_db=6.0;
@@ -264,6 +277,7 @@ t_max_err maxtrack_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err density_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err mode_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err distmode_set(t_granhoa*, t_object*, long, t_atom*);
+t_max_err headshadow_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err seed_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err headrad_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err ildmax_set(t_granhoa*, t_object*, long, t_atom*);
@@ -352,6 +366,10 @@ extern "C" int C74_EXPORT main(void){
     CLASS_ATTR_DOUBLE(c,"ild_db_max",0,t_granhoa,ild_db_max);
     CLASS_ATTR_ACCESSORS(c,"ild_db_max",NULL,(method)ildmax_set);
     CLASS_ATTR_SAVE(c,"ild_db_max",0);
+
+    CLASS_ATTR_CHAR(c,"headshadow",0,t_granhoa,headshadow_on);
+    CLASS_ATTR_ACCESSORS(c,"headshadow",NULL,(method)headshadow_set);
+    CLASS_ATTR_SAVE(c,"headshadow",0);
 
     // Transient designer
     CLASS_ATTR_DOUBLE(c,"atkboost_back_db",0,t_granhoa,atkboost_back_db);
@@ -465,6 +483,7 @@ t_max_err maxtrack_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av)
 t_max_err density_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->density=clampd(atom_getfloat(av),0.0,1.0); update_Kcur(x);} return MAX_ERR_NONE; }
 t_max_err mode_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->mode=(long)clampd(atom_getlong(av),0,1);} return MAX_ERR_NONE; }
 t_max_err distmode_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ long v=atom_getlong(av); x->dist_mode=(long)clampd(v,0,1); build_micros(x);} return MAX_ERR_NONE; }
+t_max_err headshadow_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->headshadow_on = (char)(atom_getlong(av)!=0); build_micros(x);} return MAX_ERR_NONE; }
 t_max_err seed_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->seed=(uint32_t)atom_getlong(av); build_micros(x);} return MAX_ERR_NONE; }
 t_max_err headrad_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->head_radius_m=clampd(atom_getfloat(av),0.05,0.12); build_micros(x); build_early(x);} return MAX_ERR_NONE; }
 t_max_err ildmax_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->ild_db_max=clampd(atom_getfloat(av),0.0,24.0); build_micros(x); build_early(x);} return MAX_ERR_NONE; }
@@ -548,6 +567,18 @@ static void build_micros(t_granhoa *x){
 
             // ILD
             ild_gains_from_dir(az,el,x->ild_db_max,m.gainL,m.gainR);
+
+            if(x->headshadow_on){
+                double X,Y,Z; unit_from_azel(az,el,X,Y,Z);
+                double xL,yL,zL; unit_from_azel(+M_PI/2.0,0.0,xL,yL,zL);
+                double xR,yR,zR; unit_from_azel(-M_PI/2.0,0.0,xR,yR,zR);
+                double cL=X*xL+Y*yL+Z*zL;
+                double cR=X*xR+Y*yR+Z*zR;
+                auto fc = [&](double c){ double flo=1500.0,fhi=8000.0,t=0.5*(1.0-c); return fhi*std::pow(flo/fhi,t); };
+                double sr = (x->sr>0.0)?x->sr:48000.0;
+                m.lpL.set_lp_fc(fc(cL), sr);
+                m.lpR.set_lp_fc(fc(cR), sr);
+            }
 
             // ITD (L in anticipo a sinistra, R in anticipo a destra)
             double itd = woodworth_itd(az, x->head_radius_m, x->speed_c); // sec; positivo = sinistra in anticipo
@@ -683,6 +714,10 @@ void granhoa_perform64(t_granhoa *x, t_object*, double **ins, long, double **out
 
                     double l = m.fdL.process(sig) * m.gainL;
                     double r = m.fdR.process(sig) * m.gainR;
+                    if(x->headshadow_on){
+                        l = m.lpL.process(l);
+                        r = m.lpR.process(r);
+                    }
                     L += l; R += r;
                 }
             } else {
