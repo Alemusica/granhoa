@@ -111,12 +111,70 @@ static inline void tracker_step(Tracker&t,double y){
 
 struct FracDelay {
     std::vector<double> buf; int wp=0; int mask=0; double dSamp=0.0;
+    int thiran_order=0; int thiran_int=0; double thiran_coeff[4]={1.0,0.0,0.0,0.0}; double thiran_hist[4]={0.0,0.0,0.0,0.0}; bool thiran_enabled=false;
     void init_pow2(int minLen){
         int n=1; while(n<minLen) n<<=1; buf.assign(n,0.0); mask=n-1; wp=0; dSamp=0.0;
+        for(double &h : thiran_hist) h=0.0;
     }
-    inline void setDelay(double d){ dSamp = d; }
+    inline void setThiranOrder(int order){
+        if(order!=1 && order!=3) order=0;
+        thiran_order = order;
+        thiran_enabled = false;
+        for(double &h : thiran_hist) h=0.0;
+    }
+    static void compute_thiran_coeffs(int order,double D,double *dst){
+        dst[0]=1.0;
+        for(int n=1;n<=order;++n){
+            double num=1.0, den=1.0;
+            for(int k=0;k<order;++k){
+                num *= (D - order + n + k + 1);
+                den *= (D - order + k + 1);
+            }
+            double comb=1.0;
+            for(int k=0;k<n;++k){ comb *= (double)(order-k)/(double)(k+1); }
+            double sign = (n & 1)? -1.0 : 1.0;
+            dst[n] = sign * comb * (num/den);
+        }
+        for(int n=order+1;n<4;++n) dst[n]=0.0;
+    }
+    inline void setDelay(double d){
+        dSamp = d;
+        thiran_enabled=false;
+        if(thiran_order>0){
+            double D = dSamp;
+            if(D <= (double)thiran_order){
+                return;
+            }
+            int base = (int)floor(D) - thiran_order;
+            if(base<0) base=0;
+            thiran_int=base;
+            double frac = D - std::floor(D);
+            double Dth = thiran_order + frac;
+            compute_thiran_coeffs(thiran_order, Dth, thiran_coeff);
+            for(int k=0;k<thiran_order;++k) thiran_hist[k]=0.0;
+            thiran_enabled=true;
+        }
+    }
     inline double process(double x){
         buf[wp]=x; double D=dSamp;
+        if(thiran_enabled){
+            int order=thiran_order;
+            int base = thiran_int;
+            double acc=0.0;
+            for(int k=0;k<=order;++k){
+                int idx = (wp - base - k) & mask;
+                acc += thiran_coeff[k] * buf[idx];
+            }
+            double fb=0.0;
+            for(int k=1;k<=order;++k){
+                fb += thiran_coeff[k] * thiran_hist[k-1];
+            }
+            double y = acc - fb;
+            for(int k=order-1;k>0;--k){ thiran_hist[k]=thiran_hist[k-1]; }
+            if(order>0) thiran_hist[0]=y;
+            wp = (wp+1) & mask;
+            return y;
+        }
         int id = (int)floor(D);
         double frac = D - id;
         int i3=(wp - id    ) & mask;
@@ -250,6 +308,7 @@ typedef struct _granhoa {
     double speed_c=343.0;
     double ild_db_max=12.0;
     char   headshadow_on=0;
+    long   thiran_order=0;
     char   stereo_on=0;
     bool   have_in2=false;
 
@@ -291,6 +350,7 @@ t_max_err density_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err mode_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err distmode_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err headshadow_set(t_granhoa*, t_object*, long, t_atom*);
+t_max_err thiran_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err seed_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err headrad_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err ildmax_set(t_granhoa*, t_object*, long, t_atom*);
@@ -383,6 +443,10 @@ extern "C" int C74_EXPORT main(void){
     CLASS_ATTR_CHAR(c,"headshadow",0,t_granhoa,headshadow_on);
     CLASS_ATTR_ACCESSORS(c,"headshadow",NULL,(method)headshadow_set);
     CLASS_ATTR_SAVE(c,"headshadow",0);
+
+    CLASS_ATTR_LONG(c,"thiran",0,t_granhoa,thiran_order);
+    CLASS_ATTR_ACCESSORS(c,"thiran",NULL,(method)thiran_set);
+    CLASS_ATTR_SAVE(c,"thiran",0);
 
     CLASS_ATTR_CHAR(c,"stereo",0,t_granhoa,stereo_on);
     CLASS_ATTR_SAVE(c,"stereo",0);
@@ -505,6 +569,7 @@ t_max_err density_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){
 t_max_err mode_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->mode=(long)clampd(atom_getlong(av),0,1);} return MAX_ERR_NONE; }
 t_max_err distmode_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ long v=atom_getlong(av); x->dist_mode=(long)clampd(v,0,1); build_micros(x);} return MAX_ERR_NONE; }
 t_max_err headshadow_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->headshadow_on = (char)(atom_getlong(av)!=0); build_micros(x);} return MAX_ERR_NONE; }
+t_max_err thiran_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ long v=atom_getlong(av); long ord=(v==1||v==3)?v:0; x->thiran_order=ord; build_micros(x); build_early(x);} return MAX_ERR_NONE; }
 t_max_err seed_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->seed=(uint32_t)atom_getlong(av); build_micros(x);} return MAX_ERR_NONE; }
 t_max_err headrad_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->head_radius_m=clampd(atom_getfloat(av),0.05,0.12); build_micros(x); build_early(x);} return MAX_ERR_NONE; }
 t_max_err ildmax_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->ild_db_max=clampd(atom_getfloat(av),0.0,24.0); build_micros(x); build_early(x);} return MAX_ERR_NONE; }
@@ -626,6 +691,8 @@ static void build_micros(t_granhoa *x){
 
                 m.fdL.init_pow2(maxDelaySamps);
                 m.fdR.init_pow2(maxDelaySamps);
+                m.fdL.setThiranOrder((int)x->thiran_order);
+                m.fdR.setThiranOrder((int)x->thiran_order);
                 m.fdL.setDelay(m.dL);
                 m.fdR.setDelay(m.dR);
 
@@ -678,6 +745,8 @@ static void build_early(t_granhoa *x){
 
         e.fdL.init_pow2(maxS);
         e.fdR.init_pow2(maxS);
+        e.fdL.setThiranOrder((int)x->thiran_order);
+        e.fdR.setThiranOrder((int)x->thiran_order);
         e.fdL.setDelay(dL * sr);
         e.fdR.setDelay(dR * sr);
 
