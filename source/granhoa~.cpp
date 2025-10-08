@@ -40,6 +40,38 @@ static inline void unit_from_azel(double az,double el,double&x,double&y,double&z
 }
 static inline uint32_t lcg(uint32_t&s){ s=s*1664525u+1013904223u; return s; }
 static inline double u01(uint32_t&s){ return (double)lcg(s)/4294967296.0; }
+static inline bool is_prime_int(int n){
+    if(n<2) return false;
+    if(n==2 || n==3) return true;
+    if((n & 1)==0) return false;
+    for(int d=3; d*d<=n; d+=2){
+        if(n % d == 0) return false;
+    }
+    return true;
+}
+static inline void generate_prime_ratios(long count, double jitter_cents, uint32_t &seed_state, std::vector<double> &out){
+    out.clear();
+    if(count<=0) return;
+    out.reserve((size_t)count);
+    int candidate = 2;
+    while((long)out.size() < count){
+        if(is_prime_int(candidate)){
+            double ratio = (double)candidate;
+            while(ratio >= 2.0) ratio *= 0.5;
+            while(ratio < 1.0) ratio *= 2.0;
+            if(jitter_cents > 0.0){
+                double cents = (u01(seed_state)*2.0 - 1.0) * jitter_cents;
+                double detune = pow(2.0, cents/1200.0);
+                ratio *= detune;
+                while(ratio >= 2.0) ratio *= 0.5;
+                while(ratio < 1.0) ratio *= 2.0;
+            }
+            out.push_back(ratio);
+        }
+        candidate++;
+    }
+    std::sort(out.begin(), out.end());
+}
 
 //===================== EKF tracker (3x3) =======================
 struct Tracker{
@@ -224,11 +256,18 @@ struct EarlyTap {
     double gain=0.0;
     double gL=1.0, gR=1.0;
     FracDelay fdL, fdR;
+    OnePole   lpL, lpR;
 };
 
 static inline double woodworth_itd(double az, double headRad, double c){
     double th = clampd(az, -M_PI/2.0, +M_PI/2.0);
     return (headRad/c) * (th + sin(th)); // sec
+}
+static inline double headshadow_fc_from_cos(double c){
+    double flo = 1500.0;
+    double fhi = 8000.0;
+    double t = 0.5 * (1.0 - clampd(c,-1.0,1.0));
+    return fhi * std::pow(flo / fhi, t);
 }
 static inline void ild_gains_from_dir(double az,double el,double ild_db_max,double &gL,double &gR){
     double x,y,z; unit_from_azel(az,el,x,y,z);
@@ -334,6 +373,7 @@ typedef struct _granhoa {
     double spread_el_deg=25.0;   // nuova
     double depth_bias=0.0;       // -1..+1; -1 front, +1 back
     long   dist_mode=0;          // 0=random, 1=fibonacci sphere
+    double primes_jitter_cents=0.0;
 
     std::vector<Micro> micros; // ntrack*Kmax
     std::vector<Micro> micros2;
@@ -390,6 +430,7 @@ t_max_err distmode_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err headshadow_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err thiran_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err seed_set(t_granhoa*, t_object*, long, t_atom*);
+t_max_err primesjitter_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err headrad_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err ildmax_set(t_granhoa*, t_object*, long, t_atom*);
 t_max_err spreadaz_set(t_granhoa*, t_object*, long, t_atom*);
@@ -488,6 +529,9 @@ extern "C" int C74_EXPORT main(void){
 
     CLASS_ATTR_CHAR(c,"stereo",0,t_granhoa,stereo_on);
     CLASS_ATTR_SAVE(c,"stereo",0);
+    CLASS_ATTR_DOUBLE(c,"primes_jitter_cents",0,t_granhoa,primes_jitter_cents);
+    CLASS_ATTR_ACCESSORS(c,"primes_jitter_cents",NULL,(method)primesjitter_set);
+    CLASS_ATTR_SAVE(c,"primes_jitter_cents",0);
 
     // Transient designer
     CLASS_ATTR_DOUBLE(c,"atkboost_back_db",0,t_granhoa,atkboost_back_db);
@@ -585,6 +629,34 @@ static double parse_ratio_token(const std::string &tk){
     } else return atof(tk.c_str());
 }
 void granhoa_set_ratios(t_granhoa *x, t_symbol*, long argc, t_atom *argv){
+    if(argc>0 && atom_gettype(argv)==A_SYM){
+        t_symbol *sym = atom_getsym(argv);
+        if(sym && std::strcmp(sym->s_name, "primes")==0){
+            long count = 0;
+            if(argc>1){
+                count = atom_getlong(argv+1);
+            }
+            if(count<=0) count = 8;
+            double jitter = x->primes_jitter_cents;
+            for(long i=2;i<argc;i+=2){
+                if(atom_gettype(argv+i)==A_SYM){
+                    t_symbol *opt = atom_getsym(argv+i);
+                    if(opt && std::strcmp(opt->s_name,"primes_jitter_cents")==0 && (i+1)<argc){
+                        jitter = clampd(atom_getfloat(argv+i+1),0.0,100.0);
+                    }
+                }
+            }
+            x->primes_jitter_cents = jitter;
+            std::vector<double> rr;
+            uint32_t st = x->seed ? x->seed : 1234u;
+            generate_prime_ratios(count, jitter, st, rr);
+            if(rr.empty()){ object_post((t_object*)x,"ratios: primes generated empty"); return; }
+            x->ratios = rr;
+            rebuild_all(x);
+            return;
+        }
+    }
+
     std::vector<double> rr; rr.reserve(64);
     for(long i=0;i<argc;++i){
         if(atom_gettype(argv+i)==A_SYM){ rr.push_back(parse_ratio_token(atom_getsym(argv+i)->s_name)); }
@@ -606,9 +678,10 @@ t_max_err maxtrack_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av)
 t_max_err density_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->density=clampd(atom_getfloat(av),0.0,1.0); update_Kcur(x);} return MAX_ERR_NONE; }
 t_max_err mode_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->mode=(long)clampd(atom_getlong(av),0,2);} return MAX_ERR_NONE; }
 t_max_err distmode_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ long v=atom_getlong(av); x->dist_mode=(long)clampd(v,0,1); build_micros(x);} return MAX_ERR_NONE; }
-t_max_err headshadow_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->headshadow_on = (char)(atom_getlong(av)!=0); build_micros(x);} return MAX_ERR_NONE; }
+t_max_err headshadow_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->headshadow_on = (char)(atom_getlong(av)!=0); build_micros(x); build_early(x);} return MAX_ERR_NONE; }
 t_max_err thiran_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ long v=atom_getlong(av); long ord=(v==1||v==3)?v:0; x->thiran_order=ord; build_micros(x); build_early(x);} return MAX_ERR_NONE; }
 t_max_err seed_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->seed=(uint32_t)atom_getlong(av); build_micros(x);} return MAX_ERR_NONE; }
+t_max_err primesjitter_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->primes_jitter_cents=clampd(atom_getfloat(av),0.0,100.0);} return MAX_ERR_NONE; }
 t_max_err headrad_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->head_radius_m=clampd(atom_getfloat(av),0.05,0.12); build_micros(x); build_early(x);} return MAX_ERR_NONE; }
 t_max_err ildmax_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->ild_db_max=clampd(atom_getfloat(av),0.0,24.0); build_micros(x); build_early(x);} return MAX_ERR_NONE; }
 t_max_err spreadaz_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->spread_az_deg=clampd(atom_getfloat(av),0.0,180.0); build_micros(x);} return MAX_ERR_NONE; }
@@ -711,9 +784,8 @@ static void build_micros(t_granhoa *x){
                     double xR,yR,zR; unit_from_azel(-M_PI/2.0,0.0,xR,yR,zR);
                     double cL=X*xL+Y*yL+Z*zL;
                     double cR=X*xR+Y*yR+Z*zR;
-                    auto fc = [&](double c){ double flo=1500.0,fhi=8000.0,t=0.5*(1.0-c); return fhi*std::pow(flo/fhi,t); };
-                    m.lpL.set_lp_fc(fc(cL), sr_local);
-                    m.lpR.set_lp_fc(fc(cR), sr_local);
+                    m.lpL.set_lp_fc(headshadow_fc_from_cos(cL), sr_local);
+                    m.lpR.set_lp_fc(headshadow_fc_from_cos(cR), sr_local);
                 }
 
                 // ITD (L in anticipo a sinistra, R in anticipo a destra)
@@ -778,6 +850,15 @@ static void build_early(t_granhoa *x){
         EarlyTap e{};
         e.az = az; e.el = el;
         ild_gains_from_dir(az, el, x->ild_db_max, e.gL, e.gR);
+        if(x->headshadow_on){
+            double X,Y,Z; unit_from_azel(az,el,X,Y,Z);
+            double xL,yL,zL; unit_from_azel(+M_PI/2.0,0.0,xL,yL,zL);
+            double xR,yR,zR; unit_from_azel(-M_PI/2.0,0.0,xR,yR,zR);
+            double cL = X*xL + Y*yL + Z*zL;
+            double cR = X*xR + Y*yR + Z*zR;
+            e.lpL.set_lp_fc(headshadow_fc_from_cos(cL), sr);
+            e.lpR.set_lp_fc(headshadow_fc_from_cos(cR), sr);
+        }
 
         double itd = woodworth_itd(az, x->head_radius_m, x->speed_c);
         double dL = t0 + (itd < 0.0 ? std::fabs(itd) : 0.0);
@@ -946,8 +1027,14 @@ void granhoa_perform64(t_granhoa *x, t_object*, double **ins, long, double **out
         double Le=0.0, Re=0.0;
         for(auto &e: x->early){
             double xe = ydir;
-            Le += e.fdL.process(xe) * e.gL * e.gain;
-            Re += e.fdR.process(xe) * e.gR * e.gain;
+            double ltap = e.fdL.process(xe) * e.gL * e.gain;
+            double rtap = e.fdR.process(xe) * e.gR * e.gain;
+            if(x->headshadow_on){
+                ltap = e.lpL.process(ltap);
+                rtap = e.lpR.process(rtap);
+            }
+            Le += ltap;
+            Re += rtap;
         }
         L += Le; R += Re;
 
