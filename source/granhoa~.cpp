@@ -24,6 +24,7 @@ static constexpr uint32_t D_STEREO = 1u << 0;
 static inline double wrap_pi(double x){ while(x> M_PI)x-=2.*M_PI; while(x<-M_PI)x+=2.*M_PI; return x; }
 static inline double clampd(double v,double lo,double hi){ return v<lo?lo:(v>hi?hi:v); }
 static inline double deg2rad(double d){ return d * (M_PI/180.0); }
+static inline double undenorm(double v){ return v + 1e-20 - 1e-20; }
 
 static inline void fib_point(int N, int i, double& az, double& el){
     const double ga = M_PI*(3.0 - std::sqrt(5.0));
@@ -142,7 +143,11 @@ struct OnePole{
         double a1=std::exp(-2.0*M_PI*f/sr);
         a=1.0-a1; b=a1; z=0.0;
     }
-    inline double process(double x){ z=a*x + b*z; return z; }
+    inline double process(double x){
+        double y = a*x + b*z;
+        z = undenorm(y);
+        return z;
+    }
 };
 
 struct Micro {
@@ -735,8 +740,8 @@ static inline void accum_banco(t_granhoa *x,
         if(s_i==0.0) continue;
 
         double an = fabs(s_i);
-        tr.envF = aF*tr.envF + (1.0-aF)*an;
-        tr.envS = aS*tr.envS + (1.0-aS)*an;
+        tr.envF = undenorm(aF*tr.envF + (1.0-aF)*an);
+        tr.envS = undenorm(aS*tr.envS + (1.0-aS)*an);
         double tshape = tr.envF - tr.envS; if(tshape<0.0) tshape=0.0;
         tshape = clampd(tg * tshape, 0.0, 1.0);
 
