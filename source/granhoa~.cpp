@@ -216,6 +216,7 @@ struct Micro {
 
     FracDelay fdL, fdR;
     OnePole   lpL, lpR;
+    double hoa[9] = {0.0};
 };
 
 struct EarlyTap {
@@ -239,6 +240,43 @@ static inline void ild_gains_from_dir(double az,double el,double ild_db_max,doub
     double ildR_db = (1.0 - cosR)*0.5 * ild_db_max;
     gL = pow(10.0, -ildL_db/20.0);
     gR = pow(10.0, -ildR_db/20.0);
+}
+
+static constexpr size_t MAGLS_N = 9;
+
+static inline void compute_sh2_sn3d(double az, double el, double *out){
+    double cosEl = std::cos(el);
+    double sinEl = std::sin(el);
+    double cosEl2 = cosEl * cosEl;
+    const double sqrt3  = std::sqrt(3.0);
+    const double sqrt15 = std::sqrt(15.0);
+    const double sqrt5  = std::sqrt(5.0);
+
+    out[0] = 1.0;
+    out[1] = sqrt3 * cosEl * std::sin(az);
+    out[2] = sqrt3 * sinEl;
+    out[3] = sqrt3 * cosEl * std::cos(az);
+    out[4] = 0.5 * sqrt15 * cosEl2 * std::sin(2.0 * az);
+    out[5] = sqrt15 * sinEl * cosEl * std::sin(az);
+    out[6] = 0.5 * sqrt5 * (3.0 * sinEl * sinEl - 1.0);
+    out[7] = sqrt15 * sinEl * cosEl * std::cos(az);
+    out[8] = 0.5 * sqrt15 * cosEl2 * std::cos(2.0 * az);
+}
+
+static double g_Dmag[MAGLS_N][2];
+static bool   g_Dmag_ready=false;
+
+static inline void ensure_magls_decoder(){
+    if(g_Dmag_ready) return;
+    double left[MAGLS_N];
+    double right[MAGLS_N];
+    compute_sh2_sn3d(+M_PI*0.5, 0.0, left);
+    compute_sh2_sn3d(-M_PI*0.5, 0.0, right);
+    for(size_t i=0;i<MAGLS_N;++i){
+        g_Dmag[i][0] = left[i];
+        g_Dmag[i][1] = right[i];
+    }
+    g_Dmag_ready = true;
 }
 
 struct SimpleComb {
@@ -270,7 +308,7 @@ struct SimpleComb {
 };
 
 //===================== Max object =======================
-enum Mode { MODE_ITDILD=1, MODE_HOA=0 }; // default = ITD/ILD
+enum Mode { MODE_HOA=0, MODE_ITDILD=1, MODE_MAGLS=2 }; // default = ITD/ILD
 
 typedef struct _granhoa {
     t_pxobject ob;
@@ -566,7 +604,7 @@ void granhoa_set_kfQ(t_granhoa *x, t_symbol*, long argc, t_atom *argv){
 t_max_err tonic_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->tonic_hz=atom_getfloat(av); rebuild_all(x);} return MAX_ERR_NONE; }
 t_max_err maxtrack_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ long v=atom_getlong(av); x->maxtrack=(long)clampd(v,1,128); rebuild_all(x);} return MAX_ERR_NONE; }
 t_max_err density_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->density=clampd(atom_getfloat(av),0.0,1.0); update_Kcur(x);} return MAX_ERR_NONE; }
-t_max_err mode_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->mode=(long)clampd(atom_getlong(av),0,1);} return MAX_ERR_NONE; }
+t_max_err mode_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->mode=(long)clampd(atom_getlong(av),0,2);} return MAX_ERR_NONE; }
 t_max_err distmode_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ long v=atom_getlong(av); x->dist_mode=(long)clampd(v,0,1); build_micros(x);} return MAX_ERR_NONE; }
 t_max_err headshadow_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ x->headshadow_on = (char)(atom_getlong(av)!=0); build_micros(x);} return MAX_ERR_NONE; }
 t_max_err thiran_set(t_granhoa *x, t_object*, long ac, t_atom *av){ if(ac&&av){ long v=atom_getlong(av); long ord=(v==1||v==3)?v:0; x->thiran_order=ord; build_micros(x); build_early(x);} return MAX_ERR_NONE; }
@@ -696,6 +734,8 @@ static void build_micros(t_granhoa *x){
                 m.fdL.setDelay(m.dL);
                 m.fdR.setDelay(m.dR);
 
+                compute_sh2_sn3d(az, el, m.hoa);
+
                 dest[(size_t)t*(size_t)x->Kmax + (size_t)k] = m;
             }
         }
@@ -795,7 +835,8 @@ static inline void accum_banco(t_granhoa *x,
                                double aS,
                                double tg,
                                double &L,
-                               double &R){
+                               double &R,
+                               double *maglsC){
     const long ntrack = x->ntrack;
     if(ntrack<=0 || Kcur<=0) return;
     size_t stride = (size_t)x->Kmax;
@@ -835,13 +876,22 @@ static inline void accum_banco(t_granhoa *x,
                 }
                 L += l; R += r;
             }
-        } else {
+        } else if(x->mode==MODE_HOA){
             for(long k=0;k<Kcur;++k){
                 Micro &m = micros[baseIdx + (size_t)k];
                 double boost = 1.0 + tshape * ( m.backness * k_back + (1.0 - m.backness) * k_front );
                 double sig = base * boost;
                 L += sig * cos(m.az + M_PI/2.0);
                 R += sig * cos(m.az - M_PI/2.0);
+            }
+        } else if(x->mode==MODE_MAGLS && maglsC){
+            for(long k=0;k<Kcur;++k){
+                Micro &m = micros[baseIdx + (size_t)k];
+                double boost = 1.0 + tshape * ( m.backness * k_back + (1.0 - m.backness) * k_front );
+                double sig = base * boost;
+                for(size_t j=0;j<MAGLS_N;++j){
+                    maglsC[j] += sig * m.hoa[j];
+                }
             }
         }
     }
@@ -864,19 +914,35 @@ void granhoa_perform64(t_granhoa *x, t_object*, double **ins, long, double **out
     double tailSec = x->tail_ms * 0.001;
     double gtail = (tailSec<=0.0? 0.0 : pow(10.0, -3.0*tailSec)); // -3 dB/s approx
 
+    if(x->mode==MODE_MAGLS){
+        ensure_magls_decoder();
+    }
+
     for(long i=0;i<n;++i){
         double y1 = in0[i];
         double y2 = (in1? in1[i] : 0.0);
         double L=0.0, R=0.0;
+        double c[MAGLS_N]={0.0};
+        double *cptr = (x->mode==MODE_MAGLS)?c:nullptr;
 
         // --- trackers → micros ---
-        accum_banco(x, x->tr, x->micros, y1, Kcur, k_back, k_front, aF, aS, tg, L, R);
+        accum_banco(x, x->tr, x->micros, y1, Kcur, k_back, k_front, aF, aS, tg, L, R, cptr);
         if(x->have_in2){
-            accum_banco(x, x->tr2, x->micros2, y2, Kcur, k_back, k_front, aF, aS, tg, L, R);
+            accum_banco(x, x->tr2, x->micros2, y2, Kcur, k_back, k_front, aF, aS, tg, L, R, cptr);
+        }
+
+        if(x->mode==MODE_MAGLS){
+            double Lmag=0.0, Rmag=0.0;
+            for(size_t j=0;j<MAGLS_N;++j){
+                Lmag += g_Dmag[j][0] * c[j];
+                Rmag += g_Dmag[j][1] * c[j];
+            }
+            L = Lmag;
+            R = Rmag;
         }
 
         // --- Early reflections ---
-        double ydir = y1; // canale principale
+        double ydir = y1 + y2;
         double Le=0.0, Re=0.0;
         for(auto &e: x->early){
             double xe = ydir;
