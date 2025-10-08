@@ -18,6 +18,8 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+static constexpr uint32_t D_STEREO = 1u << 0;
+
 //===================== Utils =======================
 static inline double wrap_pi(double x){ while(x> M_PI)x-=2.*M_PI; while(x<-M_PI)x+=2.*M_PI; return x; }
 static inline double clampd(double v,double lo,double hi){ return v<lo?lo:(v>hi?hi:v); }
@@ -210,6 +212,7 @@ enum Mode { MODE_ITDILD=1, MODE_HOA=0 }; // default = ITD/ILD
 typedef struct _granhoa {
     t_pxobject ob;
     double sr;
+    uint32_t dirty=0;
 
     // Parametri analisi
     double tonic_hz=440.0;
@@ -221,6 +224,7 @@ typedef struct _granhoa {
     std::vector<double> ratios;
     long ntrack=0;
     std::vector<Tracker> tr;
+    std::vector<Tracker> tr2;
 
     // micros
     long   Kmax=8, Kcur=1;
@@ -231,7 +235,9 @@ typedef struct _granhoa {
     long   dist_mode=0;          // 0=random, 1=fibonacci sphere
 
     std::vector<Micro> micros; // ntrack*Kmax
+    std::vector<Micro> micros2;
     uint32_t seed=1234u;
+    uint32_t seed2=0;
 
     // binaurale sintetico
     long   mode=MODE_ITDILD;
@@ -239,6 +245,8 @@ typedef struct _granhoa {
     double speed_c=343.0;
     double ild_db_max=12.0;
     char   headshadow_on=0;
+    char   stereo_on=0;
+    bool   have_in2=false;
 
     // transient designer
     double atkboost_back_db=6.0;
@@ -371,6 +379,9 @@ extern "C" int C74_EXPORT main(void){
     CLASS_ATTR_ACCESSORS(c,"headshadow",NULL,(method)headshadow_set);
     CLASS_ATTR_SAVE(c,"headshadow",0);
 
+    CLASS_ATTR_CHAR(c,"stereo",0,t_granhoa,stereo_on);
+    CLASS_ATTR_SAVE(c,"stereo",0);
+
     // Transient designer
     CLASS_ATTR_DOUBLE(c,"atkboost_back_db",0,t_granhoa,atkboost_back_db);
     CLASS_ATTR_ACCESSORS(c,"atkboost_back_db",NULL,(method)atkback_set);
@@ -427,11 +438,12 @@ extern "C" int C74_EXPORT main(void){
 void *granhoa_new(t_symbol*, long, t_atom*){
     t_granhoa *x=(t_granhoa*)object_alloc(granhoa_class);
     if(!x) return nullptr;
-    dsp_setup((t_pxobject*)x,1);
+    dsp_setup((t_pxobject*)x,2);
     outlet_new((t_object*)x,"signal");
     outlet_new((t_object*)x,"signal");
 
     x->sr = sys_getsr(); if(x->sr<=0) x->sr=48000.0;
+    x->seed2 = (x->seed ^ 0x9E3779B9u);
 
     // default scala
     const char *def="1/1 9/8 5/4 4/3 3/2 5/3 7/4 15/8 2/1";
@@ -449,7 +461,11 @@ void granhoa_free(t_granhoa *x){
 
 void granhoa_assist(t_granhoa *x, void*, long m,long a,char *s){
     if(m==ASSIST_INLET){
-        snprintf(s, 256, "In: segnale mono. Msg: ratios,kfQ. Attr: @tonic @density @spread_az @spread_el @depth_bias @tail_ms @predelay_ms ...");
+        if(a==0){
+            snprintf(s, 256, "In1: segnale principale (mono). Msg: ratios,kfQ. Attr: @tonic @density @spread_az @spread_el @depth_bias @tail_ms @predelay_ms ...");
+        } else {
+            snprintf(s, 256, "In2: segnale stereo opzionale (abilita @stereo 1).");
+        }
     } else {
         snprintf(s, 64, (a==0? "Out L":"Out R"));
     }
@@ -519,17 +535,22 @@ static void alloc_trackers(t_granhoa *x){
     x->sr = (sys_getsr()>0)?sys_getsr():x->sr;
     x->ntrack=(long)std::min<size_t>(x->ratios.size(), (size_t)std::max<long>(1,x->maxtrack));
     x->tr.resize(x->ntrack);
+    if(x->have_in2){
+        x->tr2.resize(x->ntrack);
+    } else {
+        x->tr2.clear();
+    }
     for(long i=0;i<x->ntrack;++i){
         double f=x->tonic_hz * x->ratios[i];
         tracker_init(x->tr[i], x->sr, f, x->drift_cents, x->Qa, x->Qth, x->Qom, x->Rmeas);
+        if(x->have_in2){
+            tracker_init(x->tr2[i], x->sr, f, x->drift_cents, x->Qa, x->Qth, x->Qom, x->Rmeas);
+        }
     }
 }
 static void build_micros(t_granhoa *x){
     if(x->Kmax<1) x->Kmax=1;
     if(x->Kcur>x->Kmax) x->Kcur=x->Kmax;
-
-    uint32_t st = x->seed?x->seed:1234u;
-    x->micros.assign((size_t)x->ntrack * (size_t)x->Kmax, Micro{});
 
     double maxITDsec = (x->head_radius_m / x->speed_c) * (M_PI/2.0 + 1.0);
     int maxDelaySamps = (int)ceil(maxITDsec * x->sr) + 16; if(maxDelaySamps<64) maxDelaySamps=64;
@@ -538,66 +559,82 @@ static void build_micros(t_granhoa *x){
     double sel = deg2rad(clampd(x->spread_el_deg,0.0,90.0));
     // centro azimuto da depth_bias: -1..+1 -> 0..pi (front..back); poi random segno L/R
     double abs_center = ((x->depth_bias + 1.0)*0.5) * M_PI;
+    double sr_local = (x->sr>0.0)?x->sr:48000.0;
 
-    for(long t=0;t<x->ntrack;++t){
-        for(long k=0;k<x->Kmax;++k){
-            double az=0.0, el=0.0;
-            if(x->dist_mode==1){
-                long idx = (x->Kmax>0)? ((k + 97 * t) % x->Kmax) : 0;
-                fib_point((int)x->Kmax, (int)idx, az, el);
-            } else {
-                double side = (u01(st)<0.5)? -1.0 : +1.0;
-                double jitter_az = (u01(st)*2.0 - 1.0) * saz;
-                double jitter_el = (u01(st)*2.0 - 1.0) * sel;
-
-                double raw = clampd(abs_center + jitter_az, 0.0, M_PI);
-                az = side * raw;
-                // porta in [-pi,pi]
-                if(az> M_PI) az-=2.0*M_PI;
-                if(az<-M_PI) az+=2.0*M_PI;
-
-                el = clampd(jitter_el, -M_PI/2.0, +M_PI/2.0);
-            }
-
-            Micro m{};
-            m.az=az; m.el=el;
-
-            // backness: 0 front (az≈0), 1 back (|az|≈pi)
-            m.backness = 0.5 * (1.0 - cos(az));
-
-            // ILD
-            ild_gains_from_dir(az,el,x->ild_db_max,m.gainL,m.gainR);
-
-            if(x->headshadow_on){
-                double X,Y,Z; unit_from_azel(az,el,X,Y,Z);
-                double xL,yL,zL; unit_from_azel(+M_PI/2.0,0.0,xL,yL,zL);
-                double xR,yR,zR; unit_from_azel(-M_PI/2.0,0.0,xR,yR,zR);
-                double cL=X*xL+Y*yL+Z*zL;
-                double cR=X*xR+Y*yR+Z*zR;
-                auto fc = [&](double c){ double flo=1500.0,fhi=8000.0,t=0.5*(1.0-c); return fhi*std::pow(flo/fhi,t); };
-                double sr = (x->sr>0.0)?x->sr:48000.0;
-                m.lpL.set_lp_fc(fc(cL), sr);
-                m.lpR.set_lp_fc(fc(cR), sr);
-            }
-
-            // ITD (L in anticipo a sinistra, R in anticipo a destra)
-            double itd = woodworth_itd(az, x->head_radius_m, x->speed_c); // sec; positivo = sinistra in anticipo
-            // Converti in campioni come ritardo applicato all'orecchio in "ombra"
-            if(itd>=0){ // sinistra vicina → ritardo a destra
-                m.dL = 0.0;
-                m.dR =  fabs(itd) * x->sr;
-            } else {
-                m.dL =  fabs(itd) * x->sr;
-                m.dR =  0.0;
-            }
-
-            m.fdL.init_pow2(maxDelaySamps);
-            m.fdR.init_pow2(maxDelaySamps);
-            m.fdL.setDelay(m.dL);
-            m.fdR.setDelay(m.dR);
-
-            x->micros[(size_t)t*(size_t)x->Kmax + (size_t)k] = m;
+    auto build_bank = [&](std::vector<Micro> &dest, uint32_t seed_state){
+        if(x->ntrack<=0){
+            dest.clear();
+            return;
         }
+        dest.assign((size_t)x->ntrack * (size_t)x->Kmax, Micro{});
+        uint32_t st = seed_state?seed_state:1234u;
+        for(long t=0;t<x->ntrack;++t){
+            for(long k=0;k<x->Kmax;++k){
+                double az=0.0, el=0.0;
+                if(x->dist_mode==1){
+                    long idx = (x->Kmax>0)? ((k + 97 * t) % x->Kmax) : 0;
+                    fib_point((int)x->Kmax, (int)idx, az, el);
+                } else {
+                    double side = (u01(st)<0.5)? -1.0 : +1.0;
+                    double jitter_az = (u01(st)*2.0 - 1.0) * saz;
+                    double jitter_el = (u01(st)*2.0 - 1.0) * sel;
+
+                    double raw = clampd(abs_center + jitter_az, 0.0, M_PI);
+                    az = side * raw;
+                    // porta in [-pi,pi]
+                    if(az> M_PI) az-=2.0*M_PI;
+                    if(az<-M_PI) az+=2.0*M_PI;
+
+                    el = clampd(jitter_el, -M_PI/2.0, +M_PI/2.0);
+                }
+
+                Micro m{};
+                m.az=az; m.el=el;
+
+                // backness: 0 front (az≈0), 1 back (|az|≈pi)
+                m.backness = 0.5 * (1.0 - cos(az));
+
+                // ILD
+                ild_gains_from_dir(az,el,x->ild_db_max,m.gainL,m.gainR);
+
+                if(x->headshadow_on){
+                    double X,Y,Z; unit_from_azel(az,el,X,Y,Z);
+                    double xL,yL,zL; unit_from_azel(+M_PI/2.0,0.0,xL,yL,zL);
+                    double xR,yR,zR; unit_from_azel(-M_PI/2.0,0.0,xR,yR,zR);
+                    double cL=X*xL+Y*yL+Z*zL;
+                    double cR=X*xR+Y*yR+Z*zR;
+                    auto fc = [&](double c){ double flo=1500.0,fhi=8000.0,t=0.5*(1.0-c); return fhi*std::pow(flo/fhi,t); };
+                    m.lpL.set_lp_fc(fc(cL), sr_local);
+                    m.lpR.set_lp_fc(fc(cR), sr_local);
+                }
+
+                // ITD (L in anticipo a sinistra, R in anticipo a destra)
+                double itd = woodworth_itd(az, x->head_radius_m, x->speed_c); // sec; positivo = sinistra in anticipo
+                // Converti in campioni come ritardo applicato all'orecchio in "ombra"
+                if(itd>=0){ // sinistra vicina → ritardo a destra
+                    m.dL = 0.0;
+                    m.dR =  fabs(itd) * x->sr;
+                } else {
+                    m.dL =  fabs(itd) * x->sr;
+                    m.dR =  0.0;
+                }
+
+                m.fdL.init_pow2(maxDelaySamps);
+                m.fdR.init_pow2(maxDelaySamps);
+                m.fdL.setDelay(m.dL);
+                m.fdR.setDelay(m.dR);
+
+                dest[(size_t)t*(size_t)x->Kmax + (size_t)k] = m;
+            }
+        }
+    };
+
+    build_bank(x->micros, x->seed);
+    x->seed2 = (x->seed ^ 0x9E3779B9u);
+    if(x->have_in2){
+        build_bank(x->micros2, x->seed2);
+    } else {
+        x->micros2.clear();
     }
 }
 static void ensure_tail(t_granhoa *x){
@@ -660,14 +697,85 @@ static void rebuild_all(t_granhoa *x){
 }
 
 //----------- DSP
-void granhoa_dsp64(t_granhoa *x, t_object *dsp64, short *, double sr, long, long){
+void granhoa_dsp64(t_granhoa *x, t_object *dsp64, short *count, double sr, long, long){
     x->sr = (sr>0)?sr:48000.0;
+    bool newHave = (x->stereo_on && count && count[1]);
+    if(newHave != x->have_in2){
+        x->have_in2 = newHave;
+        x->dirty |= D_STEREO;
+    }
+    x->seed2 = (x->seed ^ 0x9E3779B9u);
     rebuild_all(x);
+    x->dirty &= ~D_STEREO;
     object_method(dsp64, gensym("dsp_add64"), x, (method)granhoa_perform64, 0, NULL);
 }
 
+static inline void accum_banco(t_granhoa *x,
+                               std::vector<Tracker> &trackers,
+                               std::vector<Micro> &micros,
+                               double input,
+                               long Kcur,
+                               double k_back,
+                               double k_front,
+                               double aF,
+                               double aS,
+                               double tg,
+                               double &L,
+                               double &R){
+    const long ntrack = x->ntrack;
+    if(ntrack<=0 || Kcur<=0) return;
+    size_t stride = (size_t)x->Kmax;
+    if(trackers.size() < (size_t)ntrack) return;
+    if(stride==0 || micros.size() < (size_t)ntrack * stride) return;
+
+    for(long t=0;t<ntrack;++t){
+        Tracker &tr = trackers[(size_t)t];
+        tracker_step(tr, input);
+        double s_i = tr.yhat;
+        if(s_i==0.0) continue;
+
+        double an = fabs(s_i);
+        tr.envF = aF*tr.envF + (1.0-aF)*an;
+        tr.envS = aS*tr.envS + (1.0-aS)*an;
+        double tshape = tr.envF - tr.envS; if(tshape<0.0) tshape=0.0;
+        tshape = clampd(tg * tshape, 0.0, 1.0);
+
+        double base = s_i / (double)Kcur;
+        size_t baseIdx = (size_t)t * stride;
+
+        if(x->mode==MODE_ITDILD){
+            for(long k=0;k<Kcur;++k){
+                Micro &m = micros[baseIdx + (size_t)k];
+
+                double boost = 1.0 + tshape * ( m.backness * k_back + (1.0 - m.backness) * k_front );
+                if(boost < 0.0) boost = 0.0;
+                else if(boost > 4.0) boost = 4.0; // guard
+
+                double sig = base * boost;
+
+                double l = m.fdL.process(sig) * m.gainL;
+                double r = m.fdR.process(sig) * m.gainR;
+                if(x->headshadow_on){
+                    l = m.lpL.process(l);
+                    r = m.lpR.process(r);
+                }
+                L += l; R += r;
+            }
+        } else {
+            for(long k=0;k<Kcur;++k){
+                Micro &m = micros[baseIdx + (size_t)k];
+                double boost = 1.0 + tshape * ( m.backness * k_back + (1.0 - m.backness) * k_front );
+                double sig = base * boost;
+                L += sig * cos(m.az + M_PI/2.0);
+                R += sig * cos(m.az - M_PI/2.0);
+            }
+        }
+    }
+}
+
 void granhoa_perform64(t_granhoa *x, t_object*, double **ins, long, double **outs, long, long n, long){
-    double *in=ins[0], *outL=outs[0], *outR=outs[1];
+    double *in0=ins[0], *outL=outs[0], *outR=outs[1];
+    double *in1 = (x->have_in2 && ins[1]) ? ins[1] : nullptr;
     const long ntrack=x->ntrack; if(ntrack<=0){ std::memset(outL,0,sizeof(double)*n); std::memset(outR,0,sizeof(double)*n); return; }
     const long Kcur = x->Kcur;
 
@@ -683,58 +791,18 @@ void granhoa_perform64(t_granhoa *x, t_object*, double **ins, long, double **out
     double gtail = (tailSec<=0.0? 0.0 : pow(10.0, -3.0*tailSec)); // -3 dB/s approx
 
     for(long i=0;i<n;++i){
-        double y = in[i];
+        double y1 = in0[i];
+        double y2 = (in1? in1[i] : 0.0);
         double L=0.0, R=0.0;
 
         // --- trackers → micros ---
-        for(long t=0;t<ntrack;++t){
-            Tracker &tr = x->tr[t]; tracker_step(tr,y);
-            double s_i = tr.yhat;
-            if(s_i==0.0) continue;
-
-            // transient measure (per tracker): difference of envelopes
-            double an = fabs(s_i);
-            tr.envF = aF*tr.envF + (1.0-aF)*an;
-            tr.envS = aS*tr.envS + (1.0-aS)*an;
-            double tshape = tr.envF - tr.envS; if(tshape<0.0) tshape=0.0;
-            tshape = clampd(tg * tshape, 0.0, 1.0);
-
-            double base = s_i / (double)Kcur;
-
-            size_t baseIdx = (size_t)t * (size_t)x->Kmax;
-            if(x->mode==MODE_ITDILD){
-                for(long k=0;k<Kcur;++k){
-                    Micro &m = x->micros[baseIdx + (size_t)k];
-
-                    // front/back dependent attack boost
-                    double boost = 1.0 + tshape * ( m.backness * k_back + (1.0 - m.backness) * k_front );
-                    if(boost < 0.0) boost = 0.0; if(boost > 4.0) boost = 4.0; // guard
-
-                    double sig = base * boost;
-
-                    double l = m.fdL.process(sig) * m.gainL;
-                    double r = m.fdR.process(sig) * m.gainR;
-                    if(x->headshadow_on){
-                        l = m.lpL.process(l);
-                        r = m.lpR.process(r);
-                    }
-                    L += l; R += r;
-                }
-            } else {
-                // modalità HOA di fallback (semplice)
-                for(long k=0;k<Kcur;++k){
-                    Micro &m = x->micros[baseIdx + (size_t)k];
-                    double boost = 1.0 + tshape * ( m.backness * k_back + (1.0 - m.backness) * k_front );
-                    double sig = base * boost;
-                    // proiezione banalizzata su L/R
-                    L += sig * cos(m.az + M_PI/2.0);
-                    R += sig * cos(m.az - M_PI/2.0);
-                }
-            }
+        accum_banco(x, x->tr, x->micros, y1, Kcur, k_back, k_front, aF, aS, tg, L, R);
+        if(x->have_in2){
+            accum_banco(x, x->tr2, x->micros2, y2, Kcur, k_back, k_front, aF, aS, tg, L, R);
         }
 
         // --- Early reflections ---
-        double ydir = y; // mono input
+        double ydir = y1; // canale principale
         double Le=0.0, Re=0.0;
         for(auto &e: x->early){
             double xe = ydir;
